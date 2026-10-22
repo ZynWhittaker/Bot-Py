@@ -6,7 +6,7 @@ import shutil
 from pathlib import Path
 from flask import Flask
 import threading
-import json
+import requests
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -17,7 +17,6 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-from curl_cffi import requests as curl_requests
 import yt_dlp
 
 # --- KEEP ALIVE SERVER ---
@@ -51,61 +50,76 @@ URL_RE = re.compile(
     re.IGNORECASE,
 )
 
-def fetch_tiktok_curl(url: str, workdir: str) -> tuple:
-    # Pakai curl-cffi buat impersonate browser Chrome (bypass Cloudflare/TikTok WAF)
-    session = curl_requests.Session(impersonate="chrome110")
+def fetch_tiktok_ultimate(url: str, workdir: str) -> tuple:
+    """Multi-API fallback buat bypass limit."""
     
+    # 1. Coba TikWM (Header lengkap)
     try:
-        # 1. Resolve shortlink kalo ada
-        resp = session.get(url, allow_redirects=True, timeout=20)
-        vid_match = re.search(r"/video/(\d+)", resp.url)
-        if not vid_match:
-            raise Exception("Gagal resolve URL TikTok.")
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "Referer": "https://www.tikwm.com/",
+            "Origin": "https://www.tikwm.com"
+        }
+        res = requests.get("https://www.tikwm.com/api/", params={"url": url}, headers=headers, timeout=15)
+        res.raise_for_status()
+        data = res.json()
         
-        vid_id = vid_match.group(1)
-        
-        # 2. Tembak API internal TikTok pake signature browser
-        api_url = f"https://api16-normal-c-useast1a.tiktokv.com/aweme/v1/feed/?aweme_id={vid_id}"
-        api_res = session.get(api_url, timeout=20)
-        api_res.raise_for_status()
-        
-        data = api_res.json()
-        if not data.get("aweme_list"):
-            raise Exception("Respons API kosong.")
-            
-        item = data["aweme_list"][0]
-        
-        # 3. Extract metadata
-        title = item.get("desc", "No Title")
-        author = item.get("author", {}).get("unique_id", "Unknown")
-        stats = item.get("statistics", {})
-        likes = stats.get("digg_count", 0)
-        comments = stats.get("comment_count", 0)
-        saves = stats.get("collect_count", 0)
-        shares = stats.get("share_count", 0)
-        
-        # 4. Extract video URL (tanpa watermark)
-        play_addr = item["video"]["play_addr"]["url_list"][-1]
-        
-        # 5. Download file
-        v_res = session.get(play_addr, stream=True, timeout=30)
-        v_res.raise_for_status()
-        
-        fp = os.path.join(workdir, f"tt_{os.urandom(4).hex()}.mp4")
-        with open(fp, "wb") as f:
-            for chunk in v_res.iter_content(chunk_size=65536):
-                f.write(chunk)
+        if data.get("code") == 0 and data.get("data"):
+            info = data["data"]
+            play_url = info.get("play") or info.get("hdplay")
+            if play_url.startswith("/"):
+                play_url = "https://www.tikwm.com" + play_url
                 
-        caption = (
-            f"👤 *Uploader:* @{author}\n"
-            f"❤️ *Likes:* {likes:,} | 💬 *Comments:* {comments:,}\n"
-            f"⭐ *Saves:* {saves:,} | 🔁 *Shares:* {shares:,}\n\n"
-            f"📝 *Description:*\n{title}"
-        )
-        return fp, caption
-        
-    except Exception as e:
-        raise Exception(f"TikTok Bypass Gagal: {str(e)}")
+            author = info.get("author", {}).get("unique_id", "Unknown")
+            title = info.get("title", "No Title")
+            likes = info.get("digg_count", 0)
+            comments = info.get("comment_count", 0)
+            saves = info.get("collect_count", 0)
+            shares = info.get("share_count", 0)
+            
+            v_res = requests.get(play_url, stream=True, timeout=30, headers={"User-Agent": headers["User-Agent"]})
+            v_res.raise_for_status()
+            fp = os.path.join(workdir, f"tt_{os.urandom(4).hex()}.mp4")
+            with open(fp, "wb") as f:
+                for chunk in v_res.iter_content(chunk_size=65536):
+                    f.write(chunk)
+                    
+            caption = (
+                f"👤 *Uploader:* @{author}\n"
+                f"❤️ *Likes:* {likes:,} | 💬 *Comments:* {comments:,}\n"
+                f"⭐ *Saves:* {saves:,} | 🔁 *Shares:* {shares:,}\n\n"
+                f"📝 *Description:*\n{title}"
+            )
+            return fp, caption
+    except Exception:
+        pass  # Lanjut ke API kedua kalo TikWM gagal
+
+    # 2. Fallback ke API alternatif (Douyin.wtf)
+    try:
+        res = requests.get("https://api.douyin.wtf/api/hybrid/video_data", params={"url": url}, timeout=15)
+        res.raise_for_status()
+        data = res.json()
+        if "data" in data and "video_data" in data["data"]:
+            play_url = data["data"]["video_data"]["nwm_video_url"]
+            title = data["data"].get("desc", "No Title")
+            author = data["data"].get("author", "Unknown")
+            
+            v_res = requests.get(play_url, stream=True, timeout=30)
+            v_res.raise_for_status()
+            fp = os.path.join(workdir, f"tt_{os.urandom(4).hex()}.mp4")
+            with open(fp, "wb") as f:
+                for chunk in v_res.iter_content(chunk_size=65536):
+                    f.write(chunk)
+                    
+            caption = f"👤 *Uploader:* @{author}\n\n📝 *Description:*\n{title}"
+            return fp, caption
+    except Exception:
+        pass
+
+    # 3. Fallback terakhir: yt-dlp native
+    return fetch_yt(url, workdir)
+
 
 def fetch_yt(url: str, workdir: str) -> tuple:
     opts = {
@@ -132,12 +146,8 @@ async def process_download(update: Update, url: str):
     status_msg = await reply_target.reply_text("⏳ Memproses link...")
     
     try:
-        if "tiktok" in url.lower():
-            loop = asyncio.get_running_loop()
-            filepath, caption = await loop.run_in_executor(None, fetch_tiktok_curl, url, workdir)
-        else:
-            loop = asyncio.get_running_loop()
-            filepath, caption = await loop.run_in_executor(None, fetch_yt, url, workdir)
+        loop = asyncio.get_running_loop()
+        filepath, caption = await loop.run_in_executor(None, fetch_tiktok_ultimate, url, workdir)
 
         if not filepath or not os.path.exists(filepath):
             raise Exception("File kosong.")
