@@ -16,7 +16,11 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+import requests
 import yt_dlp
+# Import library TikTok
+from TikTokApi import TikTokApi
+import asyncio
 
 # --- KEEP ALIVE SERVER ---
 app_web = Flask('')
@@ -49,10 +53,56 @@ URL_RE = re.compile(
     re.IGNORECASE,
 )
 
-def _download_sync(url: str, workdir: str) -> tuple:
-    is_tiktok = "tiktok" in url.lower()
-    
-    # Opsi mutakhir yt-dlp untuk bypass TikTok & YouTube
+S = requests.Session()
+S.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+})
+
+async def fetch_tiktok_bypass(url: str, workdir: str) -> tuple:
+    vid_id = re.search(r"/video/(\d+)", url)
+    if not vid_id:
+        # Resolve shortlink
+        res = S.get(url, allow_redirects=True)
+        vid_id = re.search(r"/video/(\d+)", res.url)
+        
+    if not vid_id:
+        raise Exception("ID Video TikTok tidak ditemukan.")
+
+    # Pakai TikTokApi buat nembak API pake signature asli
+    async with TikTokApi() as api:
+        await api.create_sessions(ms_tokens=[], num_sessions=1, sleep_after=3)
+        video = api.video(id=vid_id.group(1))
+        data = await video.info()
+        
+        play_addr = data.get("video", {}).get("playAddr")
+        author = data.get("author", {}).get("uniqueId", "Unknown")
+        title = data.get("desc", "No Title")
+        stats = data.get("stats", {})
+        likes = stats.get("diggCount", 0)
+        comments = stats.get("commentCount", 0)
+        shares = stats.get("shareCount", 0)
+
+        if not play_addr:
+            raise Exception("Gagal dapet link playAddr.")
+
+        # Download video pake requests biasa
+        r = S.get(play_addr, stream=True, timeout=30, headers={"Referer": "https://www.tiktok.com/"})
+        r.raise_for_status()
+        
+        fp = os.path.join(workdir, f"tt_{os.urandom(4).hex()}.mp4")
+        with open(fp, "wb") as f:
+            for chunk in r.iter_content(chunk_size=65536):
+                f.write(chunk)
+
+        caption = (
+            f"👤 *Uploader:* @{author}\n"
+            f"❤️ *Likes:* {likes:,} | 💬 *Comments:* {comments:,}\n"
+            f"🔁 *Shares:* {shares:,}\n\n"
+            f"📝 *Description:*\n{title}"
+        )
+        return fp, caption
+
+def fetch_yt(url: str, workdir: str) -> tuple:
     opts = {
         "format": "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b",
         "merge_output_format": "mp4",
@@ -60,46 +110,15 @@ def _download_sync(url: str, workdir: str) -> tuple:
         "quiet": True,
         "no_warnings": True,
         "max_filesize": 48 * 1024 * 1024,
-        "socket_timeout": 30,
-        "retries": 5,
-        "extractor_args": {
-            "tiktok": {
-                "api_hostname": ["api16-normal-c-useast1a.tiktokv.com"],
-                "app_info": ["7355728856979392262"]
-            }
-        }
     }
-
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
-        
         fp = ydl.prepare_filename(info)
-        if not os.path.exists(fp):
-            base, _ = os.path.splitext(fp)
-            for ext in [".mp4", ".mkv", ".webm"]:
-                if os.path.exists(base + ext):
-                    fp = base + ext
-                    break
-
-        if is_tiktok:
-            author = info.get("uploader_id", info.get("uploader", "Unknown"))
-            title = info.get("title", "No Title")
-            likes = info.get("like_count", 0)
-            comments = info.get("comment_count", 0)
-            shares = info.get("repost_count", 0)
-            
-            caption = (
-                f"👤 *Uploader:* @{author}\n"
-                f"❤️ *Likes:* {likes:,} | 💬 *Comments:* {comments:,}\n"
-                f"🔁 *Shares:* {shares:,}\n\n"
-                f"📝 *Description:*\n{title}"
-            )
-        else:
-            title = info.get("title", "No Title")
-            uploader = info.get("uploader", "Unknown")
-            likes = info.get("like_count", 0)
-            caption = f"👤 *Uploader:* {uploader}\n❤️ *Likes:* {likes:,}\n\n📝 *Title:*\n{title}"
-            
+        
+        title = info.get("title", "No Title")
+        uploader = info.get("uploader", "Unknown")
+        likes = info.get("like_count", 0)
+        caption = f"👤 *Uploader:* {uploader}\n❤️ *Likes:* {likes:,}\n\n📝 *Title:*\n{title}"
         return fp, caption
 
 async def process_download(update: Update, url: str):
@@ -108,26 +127,25 @@ async def process_download(update: Update, url: str):
     status_msg = await reply_target.reply_text("⏳ Memproses link...")
     
     try:
-        loop = asyncio.get_running_loop()
-        filepath, caption = await loop.run_in_executor(None, _download_sync, url, workdir)
+        if "tiktok" in url.lower():
+            filepath, caption = await fetch_tiktok_bypass(url, workdir)
+        else:
+            loop = asyncio.get_running_loop()
+            filepath, caption = await loop.run_in_executor(None, fetch_yt, url, workdir)
 
         if not filepath or not os.path.exists(filepath):
             raise Exception("File kosong.")
 
         p = Path(filepath)
         if p.stat().st_size / (1024 * 1024) > 49:
-            await status_msg.edit_text("❌ File > 49 MB (Batas API Telegram).")
+            await status_msg.edit_text("❌ File > 49 MB.")
             return
 
         await status_msg.edit_text("📤 Mengunggah video...")
         with open(p, "rb") as f:
             await reply_target.reply_video(
-                video=f,
-                caption=caption,
-                parse_mode="Markdown",
-                supports_streaming=True,
-                read_timeout=120,
-                write_timeout=120,
+                video=f, caption=caption, parse_mode="Markdown",
+                supports_streaming=True, read_timeout=120, write_timeout=120,
             )
         await status_msg.delete()
     except Exception as e:
@@ -137,13 +155,13 @@ async def process_download(update: Update, url: str):
 
 async def cmd_vt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("⚠️ Kirim link-nya juga. Contoh: `/vt https://vt.tiktok.com/...`", parse_mode="Markdown")
+        await update.message.reply_text("⚠️ Format: `/vt <link>`")
         return
     await process_download(update, context.args[0])
 
 async def cmd_yt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("⚠️ Kirim link-nya juga. Contoh: `/yt https://youtu.be/...`", parse_mode="Markdown")
+        await update.message.reply_text("⚠️ Format: `/yt <link>`")
         return
     await process_download(update, context.args[0])
 
@@ -151,8 +169,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global PHOTO_FILE_ID
     msg = await context.bot.send_message(chat_id=update.effective_chat.id, text="Memuat menu...")
     caption = "*Your ultimate OSINT & Anti-Scam Companion.*\n\nBongkar identitas penipu, lacak jejak digital, dan amankan data lo sendiri."
-    keyboard = [[InlineKeyboardButton("📥 TikTok & YouTube Downloader", callback_data="menu_dl")]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("📥 TikTok & YouTube Downloader", callback_data="menu_dl")]])
 
     if PHOTO_FILE_ID:
         banner_msg = await context.bot.send_photo(chat_id=update.effective_chat.id, photo=PHOTO_FILE_ID, caption=caption, parse_mode="Markdown", reply_markup=reply_markup)
@@ -170,23 +187,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     if query.data == "menu_dl":
-        await query.message.edit_caption(
-            caption="*📥 TikTok & YouTube Downloader*\n\nSilakan kirim link video atau ketik command `/vt <link>` atau `/yt <link>`.",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Kembali", callback_data="menu_back")]])
-        )
+        await query.message.edit_caption(caption="*📥 TikTok & YouTube Downloader*\n\nKirim link atau ketik `/vt <link>` / `/yt <link>`.", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Kembali", callback_data="menu_back")]]))
     elif query.data == "menu_back":
-        await query.message.edit_caption(
-            caption="*Your ultimate OSINT & Anti-Scam Companion.*\n\nBongkar identitas penipu, lacak jejak digital, dan amankan data lo sendiri.",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📥 TikTok & YouTube Downloader", callback_data="menu_dl")]])
-        )
+        await query.message.edit_caption(caption="*Your ultimate OSINT & Anti-Scam Companion.*\n\nBongkar identitas penipu, lacak jejak digital, dan amankan data lo sendiri.", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📥 TikTok & YouTube Downloader", callback_data="menu_dl")]]))
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = URL_RE.search(update.message.text or "")
     if m:
-        url = re.sub(r"[^\w/\-:?=&.]+$", "", m.group(1))
-        await process_download(update, url)
+        await process_download(update, m.group(1))
 
 async def main_async():
     keep_alive()
