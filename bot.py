@@ -4,6 +4,8 @@ import asyncio
 import tempfile
 import shutil
 from pathlib import Path
+from flask import Flask
+import threading
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -16,7 +18,24 @@ from telegram.ext import (
 )
 import requests
 
-BOT_TOKEN = "8886492918:AAGKiDxAQuNQEGJz3JsfChFFpcZ6mAQlZV0"
+# --- KEEP ALIVE SERVER (BIAR RENDER NGGAK MATI) ---
+app_web = Flask('')
+
+@app_web.route('/')
+def home():
+    return "Bot is alive!"
+
+def run_web():
+    port = int(os.environ.get("PORT", 8080))
+    app_web.run(host='0.0.0.0', port=port)
+
+def keep_alive():
+    t = threading.Thread(target=run_web)
+    t.daemon = True
+    t.start()
+
+# --- KONFIGURASI BOT ---
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
 PHOTO_FILE_ID = None
 
 URL_RE = re.compile(
@@ -114,7 +133,6 @@ def _download_sync(url: str, workdir: str) -> tuple:
 
 async def process_download(update: Update, url: str):
     workdir = tempfile.mkdtemp(prefix="tgdl_")
-    # Handle reply tergantung apakah dipanggil dari command atau pesan biasa
     reply_target = update.message if update.message else update.effective_message
     status_msg = await reply_target.reply_text("⏳ Memproses link...")
     
@@ -147,31 +165,25 @@ async def process_download(update: Update, url: str):
         shutil.rmtree(workdir, ignore_errors=True)
 
 async def cmd_vt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler khusus buat /vt <link>"""
     args = context.args
     if not args:
         await update.message.reply_text("⚠️ Kirim link-nya juga. Contoh: `/vt https://vt.tiktok.com/...`", parse_mode="Markdown")
         return
-    
     url = args[0]
     if not url.startswith("http"):
         await update.message.reply_text("⚠️ Format link nggak valid. Harusnya diawali `http`.")
         return
-        
     await process_download(update, url)
 
 async def cmd_yt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler khusus buat /yt <link>"""
     args = context.args
     if not args:
         await update.message.reply_text("⚠️ Kirim link-nya juga. Contoh: `/yt https://youtu.be/...`", parse_mode="Markdown")
         return
-    
     url = args[0]
     if not url.startswith("http"):
         await update.message.reply_text("⚠️ Format link nggak valid. Harusnya diawali `http`.")
         return
-        
     await process_download(update, url)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -243,21 +255,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Nangkep pesan teks biasa yang isinya link (tanpa command)"""
     text = update.message.text or ""
     m = URL_RE.search(text)
     if not m: return
-    
     url = re.sub(r"[^\w/\-:?=&.]+$", "", m.group(1))
     await process_download(update, url)
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
     
-    # Daftarin command handler khusus
     app.add_handler(CommandHandler("vt", cmd_vt))
     app.add_handler(CommandHandler("yt", cmd_yt))
-    
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
@@ -265,4 +273,7 @@ def main():
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
+    # Nyalain web server keep-alive dulu
+    keep_alive()
+    # Baru jalanin bot telegram
     main()
