@@ -27,7 +27,8 @@ def home():
 
 def run_web():
     port = int(os.environ.get("PORT", 8080))
-    app_web.run(host='0.0.0.0', port=port)
+    # Matiin reloader & debug biar ga bikin tabrakan thread
+    app_web.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
 
 def keep_alive():
     t = threading.Thread(target=run_web)
@@ -261,19 +262,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = re.sub(r"[^\w/\-:?=&.]+$", "", m.group(1))
     await process_download(update, url)
 
-def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+# --- FUNGSI UTAMA ASYNC ---
+async def main_async():
+    # 1. Nyalain web server di background
+    keep_alive()
+
+    # 2. Setup bot
+    application = Application.builder().token(BOT_TOKEN).build()
     
-    app.add_handler(CommandHandler("vt", cmd_vt))
-    app.add_handler(CommandHandler("yt", cmd_yt))
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(button_handler))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_handler(CommandHandler("vt", cmd_vt))
+    application.add_handler(CommandHandler("yt", cmd_yt))
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CallbackQueryHandler(button_handler))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+    # 3. Inisialisasi & jalanin polling secara async
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+    
+    # 4. Tahan proses biar ga langsung exit
+    await asyncio.Event().wait()
 
 if __name__ == "__main__":
-    # Nyalain web server keep-alive dulu
-    keep_alive()
-    # Baru jalanin bot telegram
-    main()
+    try:
+        asyncio.run(main_async())
+    except (KeyboardInterrupt, SystemExit):
+        pass
