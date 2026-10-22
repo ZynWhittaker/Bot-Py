@@ -6,6 +6,7 @@ import shutil
 from pathlib import Path
 from flask import Flask
 import threading
+import json
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -16,11 +17,8 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-import requests
+from curl_cffi import requests as curl_requests
 import yt_dlp
-# Import library TikTok
-from TikTokApi import TikTokApi
-import asyncio
 
 # --- KEEP ALIVE SERVER ---
 app_web = Flask('')
@@ -53,54 +51,61 @@ URL_RE = re.compile(
     re.IGNORECASE,
 )
 
-S = requests.Session()
-S.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
-})
-
-async def fetch_tiktok_bypass(url: str, workdir: str) -> tuple:
-    vid_id = re.search(r"/video/(\d+)", url)
-    if not vid_id:
-        # Resolve shortlink
-        res = S.get(url, allow_redirects=True)
-        vid_id = re.search(r"/video/(\d+)", res.url)
+def fetch_tiktok_curl(url: str, workdir: str) -> tuple:
+    # Pakai curl-cffi buat impersonate browser Chrome (bypass Cloudflare/TikTok WAF)
+    session = curl_requests.Session(impersonate="chrome110")
+    
+    try:
+        # 1. Resolve shortlink kalo ada
+        resp = session.get(url, allow_redirects=True, timeout=20)
+        vid_match = re.search(r"/video/(\d+)", resp.url)
+        if not vid_match:
+            raise Exception("Gagal resolve URL TikTok.")
         
-    if not vid_id:
-        raise Exception("ID Video TikTok tidak ditemukan.")
-
-    # Pakai TikTokApi buat nembak API pake signature asli
-    async with TikTokApi() as api:
-        await api.create_sessions(ms_tokens=[], num_sessions=1, sleep_after=3)
-        video = api.video(id=vid_id.group(1))
-        data = await video.info()
+        vid_id = vid_match.group(1)
         
-        play_addr = data.get("video", {}).get("playAddr")
-        author = data.get("author", {}).get("uniqueId", "Unknown")
-        title = data.get("desc", "No Title")
-        stats = data.get("stats", {})
-        likes = stats.get("diggCount", 0)
-        comments = stats.get("commentCount", 0)
-        shares = stats.get("shareCount", 0)
-
-        if not play_addr:
-            raise Exception("Gagal dapet link playAddr.")
-
-        # Download video pake requests biasa
-        r = S.get(play_addr, stream=True, timeout=30, headers={"Referer": "https://www.tiktok.com/"})
-        r.raise_for_status()
+        # 2. Tembak API internal TikTok pake signature browser
+        api_url = f"https://api16-normal-c-useast1a.tiktokv.com/aweme/v1/feed/?aweme_id={vid_id}"
+        api_res = session.get(api_url, timeout=20)
+        api_res.raise_for_status()
+        
+        data = api_res.json()
+        if not data.get("aweme_list"):
+            raise Exception("Respons API kosong.")
+            
+        item = data["aweme_list"][0]
+        
+        # 3. Extract metadata
+        title = item.get("desc", "No Title")
+        author = item.get("author", {}).get("unique_id", "Unknown")
+        stats = item.get("statistics", {})
+        likes = stats.get("digg_count", 0)
+        comments = stats.get("comment_count", 0)
+        saves = stats.get("collect_count", 0)
+        shares = stats.get("share_count", 0)
+        
+        # 4. Extract video URL (tanpa watermark)
+        play_addr = item["video"]["play_addr"]["url_list"][-1]
+        
+        # 5. Download file
+        v_res = session.get(play_addr, stream=True, timeout=30)
+        v_res.raise_for_status()
         
         fp = os.path.join(workdir, f"tt_{os.urandom(4).hex()}.mp4")
         with open(fp, "wb") as f:
-            for chunk in r.iter_content(chunk_size=65536):
+            for chunk in v_res.iter_content(chunk_size=65536):
                 f.write(chunk)
-
+                
         caption = (
             f"👤 *Uploader:* @{author}\n"
             f"❤️ *Likes:* {likes:,} | 💬 *Comments:* {comments:,}\n"
-            f"🔁 *Shares:* {shares:,}\n\n"
+            f"⭐ *Saves:* {saves:,} | 🔁 *Shares:* {shares:,}\n\n"
             f"📝 *Description:*\n{title}"
         )
         return fp, caption
+        
+    except Exception as e:
+        raise Exception(f"TikTok Bypass Gagal: {str(e)}")
 
 def fetch_yt(url: str, workdir: str) -> tuple:
     opts = {
@@ -128,7 +133,8 @@ async def process_download(update: Update, url: str):
     
     try:
         if "tiktok" in url.lower():
-            filepath, caption = await fetch_tiktok_bypass(url, workdir)
+            loop = asyncio.get_running_loop()
+            filepath, caption = await loop.run_in_executor(None, fetch_tiktok_curl, url, workdir)
         else:
             loop = asyncio.get_running_loop()
             filepath, caption = await loop.run_in_executor(None, fetch_yt, url, workdir)
