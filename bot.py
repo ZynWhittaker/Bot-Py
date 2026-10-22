@@ -7,7 +7,6 @@ from pathlib import Path
 from flask import Flask
 import threading
 import requests
-import yt_dlp
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -18,9 +17,11 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+import yt_dlp
 
 # --- KEEP ALIVE SERVER ---
 app_web = Flask('')
+
 @app_web.route('/')
 def home():
     return "Bot is alive!"
@@ -49,15 +50,78 @@ URL_RE = re.compile(
     re.IGNORECASE,
 )
 
-def _download_sync(url: str, workdir: str) -> tuple:
-    # Siapin Cookie palsu biar dianggap user asli
-    cookie_file = os.path.join(workdir, "cookies.txt")
-    with open(cookie_file, "w") as f:
-        f.write("# Netscape HTTP Cookie File\n")
-        f.write(".tiktok.com\tTRUE\t/\tFALSE\t0\tttwid\t1\n")
-        f.write(".tiktok.com\tTRUE\t/\tFALSE\t0\ts_v_web_id\tverify_123456\n")
-        f.write(".tiktok.com\tTRUE\t/\tFALSE\t0\ttt_csrf_token\t123456\n")
+S = requests.Session()
+S.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+})
 
+def fetch_snaptik(url: str, workdir: str) -> tuple:
+    """Bypass pake Snaptik"""
+    try:
+        # 1. Ambil token CSRF
+        res = S.get("https://snaptik.app/", timeout=15)
+        token = re.search(r'name="token" value="(.*?)"', res.text).group(1)
+        
+        # 2. Request download
+        headers = {"Referer": "https://snaptik.app/", "Origin": "https://snaptik.app"}
+        data = {"url": url, "token": token}
+        res = S.post("https://snaptik.app/abc2.php", data=data, headers=headers, timeout=20)
+        
+        # 3. Cari link download
+        match = re.search(r'href="(https://snaptik\.app/get\?[^"]+)"', res.text)
+        if not match:
+            raise Exception("Link download Snaptik tidak ditemukan.")
+            
+        dl_url = match.group(1)
+        
+        # 4. Unduh file
+        v_res = S.get(dl_url, stream=True, timeout=30)
+        v_res.raise_for_status()
+        
+        fp = os.path.join(workdir, f"tt_{os.urandom(4).hex()}.mp4")
+        with open(fp, "wb") as f:
+            for chunk in v_res.iter_content(chunk_size=65536):
+                f.write(chunk)
+                
+        return fp, "👤 *Uploader:* Unknown\n📝 *Description:* Video TikTok (Snaptik)"
+    except Exception as e:
+        raise Exception(f"Snaptik Gagal: {str(e)}")
+
+def fetch_ssstik(url: str, workdir: str) -> tuple:
+    """Bypass pake SSSTik"""
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "Origin": "https://ssstik.io",
+            "Referer": "https://ssstik.io/en"
+        }
+        data = {"id": url, "locale": "en", "tt": "Y2hlY2tJc0h1bWFu"}
+        res = S.post("https://ssstik.io/abc?url=dl", data=data, headers=headers, timeout=20)
+        
+        # Cari link mp4
+        match = re.search(r'href="(https://ssstik\.io[^"]+\.mp4)"', res.text)
+        if not match:
+            raise Exception("Link download SSSTik tidak ditemukan.")
+            
+        dl_url = match.group(1)
+        
+        v_res = S.get(dl_url, stream=True, timeout=30)
+        v_res.raise_for_status()
+        
+        fp = os.path.join(workdir, f"tt_{os.urandom(4).hex()}.mp4")
+        with open(fp, "wb") as f:
+            for chunk in v_res.iter_content(chunk_size=65536):
+                f.write(chunk)
+                
+        return fp, "👤 *Uploader:* Unknown\n📝 *Description:* Video TikTok (SSSTik)"
+    except Exception as e:
+        raise Exception(f"SSSTik Gagal: {str(e)}")
+
+def fetch_yt_dlp_engine(url: str, workdir: str) -> tuple:
+    """Khusus YouTube."""
     opts = {
         "format": "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b",
         "merge_output_format": "mp4",
@@ -65,64 +129,33 @@ def _download_sync(url: str, workdir: str) -> tuple:
         "quiet": True,
         "no_warnings": True,
         "max_filesize": 48 * 1024 * 1024,
-        "socket_timeout": 30,
-        "retries": 3,
-        "cookiefile": cookie_file, # Inject cookie
-        "extractor_args": {
-            "tiktok": {
-                "api_hostname": ["api16-normal-c-useast1a.tiktokv.com"],
-                "app_info": ["7355728856979392262"]
-            }
-        }
     }
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        fp = ydl.prepare_filename(info)
+        
+        title = info.get("title", "No Title")
+        uploader = info.get("uploader", "Unknown")
+        likes = info.get("like_count", 0)
+        caption = f"👤 *Uploader:* {uploader}\n❤️ *Likes:* {likes:,}\n\n📝 *Title:*\n{title}"
+        return fp, caption
 
-    # Coba yt-dlp dulu
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            fp = ydl.prepare_filename(info)
-            if not os.path.exists(fp):
-                base, _ = os.path.splitext(fp)
-                for ext in [".mp4", ".mkv", ".webm"]:
-                    if os.path.exists(base + ext):
-                        fp = base + ext
-                        break
-            
-            title = info.get("title", "No Title")
-            uploader = info.get("uploader", "Unknown")
-            likes = info.get("like_count", 0)
-            caption = f"👤 *Uploader:* {uploader}\n❤️ *Likes:* {likes:,}\n\n📝 *Title:*\n{title}"
-            return fp, caption
-    except Exception as e:
-        # Kalau yt-dlp masih bandel, fallback ke API (kalo lagi ga limit)
-        if "tiktok" in url.lower():
-            try:
-                headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-                res = requests.get("https://www.tikwm.com/api/", params={"url": url}, headers=headers, timeout=15)
-                res.raise_for_status()
-                data = res.json()
-                if data.get("code") == 0 and data.get("data"):
-                    info = data["data"]
-                    play_url = info.get("play") or info.get("hdplay")
-                    if play_url.startswith("/"):
-                        play_url = "https://www.tikwm.com" + play_url
-                        
-                    v_res = requests.get(play_url, stream=True, timeout=30)
-                    v_res.raise_for_status()
-                    fp = os.path.join(workdir, f"tt_{os.urandom(4).hex()}.mp4")
-                    with open(fp, "wb") as f:
-                        for chunk in v_res.iter_content(chunk_size=65536):
-                            f.write(chunk)
-                            
-                    caption = (
-                        f"👤 *Uploader:* @{info.get('author', {}).get('unique_id', 'Unknown')}\n"
-                        f"❤️ *Likes:* {info.get('digg_count', 0):,}\n"
-                        f"📝 *Description:*\n{info.get('title', 'No Title')}"
-                    )
-                    return fp, caption
-            except Exception:
-                pass
-        raise Exception(f"Download Gagal: {str(e)[:100]}")
+def _download_sync(url: str, workdir: str) -> tuple:
+    if "tiktok" in url.lower():
+        # Coba Snaptik
+        try:
+            return fetch_snaptik(url, workdir)
+        except Exception:
+            pass
+        # Kalo gagal, coba SSSTik
+        try:
+            return fetch_ssstik(url, workdir)
+        except Exception:
+            pass
+        raise Exception("TikTok diblokir total (Render IP blacklisted).")
+    else:
+        # YouTube
+        return fetch_yt_dlp_engine(url, workdir)
 
 async def process_download(update: Update, url: str):
     workdir = tempfile.mkdtemp(prefix="tgdl_")
