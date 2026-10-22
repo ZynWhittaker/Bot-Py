@@ -50,10 +50,30 @@ URL_RE = re.compile(
     re.IGNORECASE,
 )
 
-def fetch_tiktok_ultimate(url: str, workdir: str) -> tuple:
-    """Multi-API fallback buat bypass limit."""
+def fetch_yt_dlp_engine(url: str, workdir: str) -> tuple:
+    """Engine yt-dlp untuk YouTube dan fallback TikTok."""
+    opts = {
+        "format": "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b",
+        "merge_output_format": "mp4",
+        "outtmpl": os.path.join(workdir, "%(id)s.%(ext)s"),
+        "quiet": True,
+        "no_warnings": True,
+        "max_filesize": 48 * 1024 * 1024,
+    }
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        fp = ydl.prepare_filename(info)
+        
+        title = info.get("title", "No Title")
+        uploader = info.get("uploader", "Unknown")
+        likes = info.get("like_count", 0)
+        caption = f"👤 *Uploader:* {uploader}\n❤️ *Likes:* {likes:,}\n\n📝 *Title:*\n{title}"
+        return fp, caption
+
+def fetch_tiktok_api_first(url: str, workdir: str) -> tuple:
+    """API-First bypass buat Render."""
     
-    # 1. Coba TikWM (Header lengkap)
+    # 1. Coba TikWM
     try:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -93,9 +113,9 @@ def fetch_tiktok_ultimate(url: str, workdir: str) -> tuple:
             )
             return fp, caption
     except Exception:
-        pass  # Lanjut ke API kedua kalo TikWM gagal
+        pass # Lanjut ke API kedua
 
-    # 2. Fallback ke API alternatif (Douyin.wtf)
+    # 2. Coba API alternatif
     try:
         res = requests.get("https://api.douyin.wtf/api/hybrid/video_data", params={"url": url}, timeout=15)
         res.raise_for_status()
@@ -117,28 +137,9 @@ def fetch_tiktok_ultimate(url: str, workdir: str) -> tuple:
     except Exception:
         pass
 
-    # 3. Fallback terakhir: yt-dlp native
-    return fetch_yt(url, workdir)
+    # 3. Fallback terakhir: yt-dlp
+    return fetch_yt_dlp_engine(url, workdir)
 
-
-def fetch_yt(url: str, workdir: str) -> tuple:
-    opts = {
-        "format": "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b",
-        "merge_output_format": "mp4",
-        "outtmpl": os.path.join(workdir, "%(id)s.%(ext)s"),
-        "quiet": True,
-        "no_warnings": True,
-        "max_filesize": 48 * 1024 * 1024,
-    }
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        fp = ydl.prepare_filename(info)
-        
-        title = info.get("title", "No Title")
-        uploader = info.get("uploader", "Unknown")
-        likes = info.get("like_count", 0)
-        caption = f"👤 *Uploader:* {uploader}\n❤️ *Likes:* {likes:,}\n\n📝 *Title:*\n{title}"
-        return fp, caption
 
 async def process_download(update: Update, url: str):
     workdir = tempfile.mkdtemp(prefix="tgdl_")
@@ -147,7 +148,12 @@ async def process_download(update: Update, url: str):
     
     try:
         loop = asyncio.get_running_loop()
-        filepath, caption = await loop.run_in_executor(None, fetch_tiktok_ultimate, url, workdir)
+        if "tiktok" in url.lower():
+            # Pake API-First buat TikTok
+            filepath, caption = await loop.run_in_executor(None, fetch_tiktok_api_first, url, workdir)
+        else:
+            # Langsung yt-dlp buat YouTube
+            filepath, caption = await loop.run_in_executor(None, fetch_yt_dlp_engine, url, workdir)
 
         if not filepath or not os.path.exists(filepath):
             raise Exception("File kosong.")
