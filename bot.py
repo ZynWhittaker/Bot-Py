@@ -7,6 +7,7 @@ from pathlib import Path
 from flask import Flask
 import threading
 import requests
+import yt_dlp
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -17,11 +18,9 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-import yt_dlp
 
 # --- KEEP ALIVE SERVER ---
 app_web = Flask('')
-
 @app_web.route('/')
 def home():
     return "Bot is alive!"
@@ -50,8 +49,15 @@ URL_RE = re.compile(
     re.IGNORECASE,
 )
 
-def fetch_yt_dlp_engine(url: str, workdir: str) -> tuple:
-    """Engine yt-dlp untuk YouTube dan fallback TikTok."""
+def _download_sync(url: str, workdir: str) -> tuple:
+    # Siapin Cookie palsu biar dianggap user asli
+    cookie_file = os.path.join(workdir, "cookies.txt")
+    with open(cookie_file, "w") as f:
+        f.write("# Netscape HTTP Cookie File\n")
+        f.write(".tiktok.com\tTRUE\t/\tFALSE\t0\tttwid\t1\n")
+        f.write(".tiktok.com\tTRUE\t/\tFALSE\t0\ts_v_web_id\tverify_123456\n")
+        f.write(".tiktok.com\tTRUE\t/\tFALSE\t0\ttt_csrf_token\t123456\n")
+
     opts = {
         "format": "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b",
         "merge_output_format": "mp4",
@@ -59,87 +65,64 @@ def fetch_yt_dlp_engine(url: str, workdir: str) -> tuple:
         "quiet": True,
         "no_warnings": True,
         "max_filesize": 48 * 1024 * 1024,
-    }
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        fp = ydl.prepare_filename(info)
-        
-        title = info.get("title", "No Title")
-        uploader = info.get("uploader", "Unknown")
-        likes = info.get("like_count", 0)
-        caption = f"👤 *Uploader:* {uploader}\n❤️ *Likes:* {likes:,}\n\n📝 *Title:*\n{title}"
-        return fp, caption
-
-def fetch_tiktok_api_first(url: str, workdir: str) -> tuple:
-    """API-First bypass buat Render."""
-    
-    # 1. Coba TikWM
-    try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "Accept": "application/json, text/plain, */*",
-            "Referer": "https://www.tikwm.com/",
-            "Origin": "https://www.tikwm.com"
+        "socket_timeout": 30,
+        "retries": 3,
+        "cookiefile": cookie_file, # Inject cookie
+        "extractor_args": {
+            "tiktok": {
+                "api_hostname": ["api16-normal-c-useast1a.tiktokv.com"],
+                "app_info": ["7355728856979392262"]
+            }
         }
-        res = requests.get("https://www.tikwm.com/api/", params={"url": url}, headers=headers, timeout=15)
-        res.raise_for_status()
-        data = res.json()
-        
-        if data.get("code") == 0 and data.get("data"):
-            info = data["data"]
-            play_url = info.get("play") or info.get("hdplay")
-            if play_url.startswith("/"):
-                play_url = "https://www.tikwm.com" + play_url
-                
-            author = info.get("author", {}).get("unique_id", "Unknown")
-            title = info.get("title", "No Title")
-            likes = info.get("digg_count", 0)
-            comments = info.get("comment_count", 0)
-            saves = info.get("collect_count", 0)
-            shares = info.get("share_count", 0)
-            
-            v_res = requests.get(play_url, stream=True, timeout=30, headers={"User-Agent": headers["User-Agent"]})
-            v_res.raise_for_status()
-            fp = os.path.join(workdir, f"tt_{os.urandom(4).hex()}.mp4")
-            with open(fp, "wb") as f:
-                for chunk in v_res.iter_content(chunk_size=65536):
-                    f.write(chunk)
-                    
-            caption = (
-                f"👤 *Uploader:* @{author}\n"
-                f"❤️ *Likes:* {likes:,} | 💬 *Comments:* {comments:,}\n"
-                f"⭐ *Saves:* {saves:,} | 🔁 *Shares:* {shares:,}\n\n"
-                f"📝 *Description:*\n{title}"
-            )
-            return fp, caption
-    except Exception:
-        pass # Lanjut ke API kedua
+    }
 
-    # 2. Coba API alternatif
+    # Coba yt-dlp dulu
     try:
-        res = requests.get("https://api.douyin.wtf/api/hybrid/video_data", params={"url": url}, timeout=15)
-        res.raise_for_status()
-        data = res.json()
-        if "data" in data and "video_data" in data["data"]:
-            play_url = data["data"]["video_data"]["nwm_video_url"]
-            title = data["data"].get("desc", "No Title")
-            author = data["data"].get("author", "Unknown")
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            fp = ydl.prepare_filename(info)
+            if not os.path.exists(fp):
+                base, _ = os.path.splitext(fp)
+                for ext in [".mp4", ".mkv", ".webm"]:
+                    if os.path.exists(base + ext):
+                        fp = base + ext
+                        break
             
-            v_res = requests.get(play_url, stream=True, timeout=30)
-            v_res.raise_for_status()
-            fp = os.path.join(workdir, f"tt_{os.urandom(4).hex()}.mp4")
-            with open(fp, "wb") as f:
-                for chunk in v_res.iter_content(chunk_size=65536):
-                    f.write(chunk)
-                    
-            caption = f"👤 *Uploader:* @{author}\n\n📝 *Description:*\n{title}"
+            title = info.get("title", "No Title")
+            uploader = info.get("uploader", "Unknown")
+            likes = info.get("like_count", 0)
+            caption = f"👤 *Uploader:* {uploader}\n❤️ *Likes:* {likes:,}\n\n📝 *Title:*\n{title}"
             return fp, caption
-    except Exception:
-        pass
-
-    # 3. Fallback terakhir: yt-dlp
-    return fetch_yt_dlp_engine(url, workdir)
-
+    except Exception as e:
+        # Kalau yt-dlp masih bandel, fallback ke API (kalo lagi ga limit)
+        if "tiktok" in url.lower():
+            try:
+                headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+                res = requests.get("https://www.tikwm.com/api/", params={"url": url}, headers=headers, timeout=15)
+                res.raise_for_status()
+                data = res.json()
+                if data.get("code") == 0 and data.get("data"):
+                    info = data["data"]
+                    play_url = info.get("play") or info.get("hdplay")
+                    if play_url.startswith("/"):
+                        play_url = "https://www.tikwm.com" + play_url
+                        
+                    v_res = requests.get(play_url, stream=True, timeout=30)
+                    v_res.raise_for_status()
+                    fp = os.path.join(workdir, f"tt_{os.urandom(4).hex()}.mp4")
+                    with open(fp, "wb") as f:
+                        for chunk in v_res.iter_content(chunk_size=65536):
+                            f.write(chunk)
+                            
+                    caption = (
+                        f"👤 *Uploader:* @{info.get('author', {}).get('unique_id', 'Unknown')}\n"
+                        f"❤️ *Likes:* {info.get('digg_count', 0):,}\n"
+                        f"📝 *Description:*\n{info.get('title', 'No Title')}"
+                    )
+                    return fp, caption
+            except Exception:
+                pass
+        raise Exception(f"Download Gagal: {str(e)[:100]}")
 
 async def process_download(update: Update, url: str):
     workdir = tempfile.mkdtemp(prefix="tgdl_")
@@ -148,12 +131,7 @@ async def process_download(update: Update, url: str):
     
     try:
         loop = asyncio.get_running_loop()
-        if "tiktok" in url.lower():
-            # Pake API-First buat TikTok
-            filepath, caption = await loop.run_in_executor(None, fetch_tiktok_api_first, url, workdir)
-        else:
-            # Langsung yt-dlp buat YouTube
-            filepath, caption = await loop.run_in_executor(None, fetch_yt_dlp_engine, url, workdir)
+        filepath, caption = await loop.run_in_executor(None, _download_sync, url, workdir)
 
         if not filepath or not os.path.exists(filepath):
             raise Exception("File kosong.")
