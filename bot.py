@@ -6,25 +6,13 @@ import shutil
 from pathlib import Path
 from flask import Flask
 import threading
-import requests
-
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-    filters,
-)
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 import yt_dlp
 
-# --- KEEP ALIVE SERVER ---
 app_web = Flask('')
-
 @app_web.route('/')
-def home():
-    return "Bot is alive!"
+def home(): return "Bot is alive!"
 
 def run_web():
     port = int(os.environ.get("PORT", 8080))
@@ -35,101 +23,39 @@ def keep_alive():
     t.daemon = True
     t.start()
 
-# --- KONFIGURASI BOT ---
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 PHOTO_FILE_ID = None
 
-URL_RE = re.compile(
-    r"(https?://(?:www\.)?(?:"
-    r"tiktok\.com/@[^\s/]+/video/\d+|"
-    r"(?:vm|vt)\.tiktok\.com/[A-Za-z0-9]+|"
-    r"youtube\.com/watch\?v=[\w-]+|"
-    r"youtu\.be/[\w-]+|"
-    r"youtube\.com/shorts/[\w-]+"
-    r")[^\s]*)",
-    re.IGNORECASE,
-)
+# ==========================================
+# TARO COOKIE ASLI DARI BROWSER LO DI SINI
+# (Buka TikTok di Chrome -> F12 -> Network -> 
+# copy isi header 'Cookie' dari request /api/post/item_list/)
+# ==========================================
+TIKTOK_COOKIE_STR = "msToken=...; tt_csrf_token=...; ttwid=...; s_v_web_id=..."
+# ==========================================
 
-S = requests.Session()
-S.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "*/*",
-    "Accept-Language": "en-US,en;q=0.9",
-})
+URL_RE = re.compile(r"(https?://(?:www\.)?(?:tiktok\.com/@[^\s/]+/video/\d+|(?:vm|vt)\.tiktok\.com/[A-Za-z0-9]+|youtube\.com/watch\?v=[\w-]+|youtu\.be/[\w-]+|youtube\.com/shorts/[\w-]+)[^\s]*)", re.IGNORECASE)
 
-def fetch_snaptik(url: str, workdir: str) -> tuple:
-    """Bypass pake Snaptik"""
-    try:
-        # 1. Ambil token CSRF
-        res = S.get("https://snaptik.app/", timeout=15)
-        token = re.search(r'name="token" value="(.*?)"', res.text).group(1)
-        
-        # 2. Request download
-        headers = {"Referer": "https://snaptik.app/", "Origin": "https://snaptik.app"}
-        data = {"url": url, "token": token}
-        res = S.post("https://snaptik.app/abc2.php", data=data, headers=headers, timeout=20)
-        
-        # 3. Cari link download
-        match = re.search(r'href="(https://snaptik\.app/get\?[^"]+)"', res.text)
-        if not match:
-            raise Exception("Link download Snaptik tidak ditemukan.")
-            
-        dl_url = match.group(1)
-        
-        # 4. Unduh file
-        v_res = S.get(dl_url, stream=True, timeout=30)
-        v_res.raise_for_status()
-        
-        fp = os.path.join(workdir, f"tt_{os.urandom(4).hex()}.mp4")
-        with open(fp, "wb") as f:
-            for chunk in v_res.iter_content(chunk_size=65536):
-                f.write(chunk)
-                
-        return fp, "👤 *Uploader:* Unknown\n📝 *Description:* Video TikTok (Snaptik)"
-    except Exception as e:
-        raise Exception(f"Snaptik Gagal: {str(e)}")
+def _download_sync(url: str, workdir: str) -> tuple:
+    cookie_file = os.path.join(workdir, "cookies.txt")
+    
+    # Format string cookie ke Netscape Cookie File
+    with open(cookie_file, "w") as f:
+        f.write("# Netscape HTTP Cookie File\n")
+        for item in TIKTOK_COOKIE_STR.split(";"):
+            if "=" in item:
+                k, v = item.strip().split("=", 1)
+                f.write(f".tiktok.com\tTRUE\t/\tFALSE\t0\t{k}\t{v}\n")
 
-def fetch_ssstik(url: str, workdir: str) -> tuple:
-    """Bypass pake SSSTik"""
-    try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-            "Origin": "https://ssstik.io",
-            "Referer": "https://ssstik.io/en"
-        }
-        data = {"id": url, "locale": "en", "tt": "Y2hlY2tJc0h1bWFu"}
-        res = S.post("https://ssstik.io/abc?url=dl", data=data, headers=headers, timeout=20)
-        
-        # Cari link mp4
-        match = re.search(r'href="(https://ssstik\.io[^"]+\.mp4)"', res.text)
-        if not match:
-            raise Exception("Link download SSSTik tidak ditemukan.")
-            
-        dl_url = match.group(1)
-        
-        v_res = S.get(dl_url, stream=True, timeout=30)
-        v_res.raise_for_status()
-        
-        fp = os.path.join(workdir, f"tt_{os.urandom(4).hex()}.mp4")
-        with open(fp, "wb") as f:
-            for chunk in v_res.iter_content(chunk_size=65536):
-                f.write(chunk)
-                
-        return fp, "👤 *Uploader:* Unknown\n📝 *Description:* Video TikTok (SSSTik)"
-    except Exception as e:
-        raise Exception(f"SSSTik Gagal: {str(e)}")
-
-def fetch_yt_dlp_engine(url: str, workdir: str) -> tuple:
-    """Khusus YouTube."""
     opts = {
-        "format": "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b",
-        "merge_output_format": "mp4",
+        "format": "b[ext=mp4]/b",
         "outtmpl": os.path.join(workdir, "%(id)s.%(ext)s"),
         "quiet": True,
         "no_warnings": True,
         "max_filesize": 48 * 1024 * 1024,
+        "cookiefile": cookie_file,
     }
+    
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
         fp = ydl.prepare_filename(info)
@@ -137,31 +63,21 @@ def fetch_yt_dlp_engine(url: str, workdir: str) -> tuple:
         title = info.get("title", "No Title")
         uploader = info.get("uploader", "Unknown")
         likes = info.get("like_count", 0)
-        caption = f"👤 *Uploader:* {uploader}\n❤️ *Likes:* {likes:,}\n\n📝 *Title:*\n{title}"
+        comments = info.get("comment_count", 0)
+        shares = info.get("repost_count", 0)
+        
+        caption = (
+            f"👤 *Uploader:* {uploader}\n"
+            f"❤️ *Likes:* {likes:,} | 💬 *Comments:* {comments:,}\n"
+            f"🔁 *Shares:* {shares:,}\n\n"
+            f"📝 *Title:*\n{title}"
+        )
         return fp, caption
-
-def _download_sync(url: str, workdir: str) -> tuple:
-    if "tiktok" in url.lower():
-        # Coba Snaptik
-        try:
-            return fetch_snaptik(url, workdir)
-        except Exception:
-            pass
-        # Kalo gagal, coba SSSTik
-        try:
-            return fetch_ssstik(url, workdir)
-        except Exception:
-            pass
-        raise Exception("TikTok diblokir total (Render IP blacklisted).")
-    else:
-        # YouTube
-        return fetch_yt_dlp_engine(url, workdir)
 
 async def process_download(update: Update, url: str):
     workdir = tempfile.mkdtemp(prefix="tgdl_")
     reply_target = update.message if update.message else update.effective_message
     status_msg = await reply_target.reply_text("⏳ Memproses link...")
-    
     try:
         loop = asyncio.get_running_loop()
         filepath, caption = await loop.run_in_executor(None, _download_sync, url, workdir)
@@ -187,15 +103,11 @@ async def process_download(update: Update, url: str):
         shutil.rmtree(workdir, ignore_errors=True)
 
 async def cmd_vt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("⚠️ Format: `/vt <link>`")
-        return
+    if not context.args: return await update.message.reply_text("⚠️ Format: `/vt <link>`")
     await process_download(update, context.args[0])
 
 async def cmd_yt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("⚠️ Format: `/yt <link>`")
-        return
+    if not context.args: return await update.message.reply_text("⚠️ Format: `/yt <link>`")
     await process_download(update, context.args[0])
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -205,7 +117,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("📥 TikTok & YouTube Downloader", callback_data="menu_dl")]])
 
     if PHOTO_FILE_ID:
-        banner_msg = await context.bot.send_photo(chat_id=update.effective_chat.id, photo=PHOTO_FILE_ID, caption=caption, parse_mode="Markdown", reply_markup=reply_markup)
+        await context.bot.send_photo(chat_id=update.effective_chat.id, photo=PHOTO_FILE_ID, caption=caption, parse_mode="Markdown", reply_markup=reply_markup)
     else:
         try:
             with open("banner.jpg", "rb") as photo_file:
@@ -226,8 +138,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = URL_RE.search(update.message.text or "")
-    if m:
-        await process_download(update, m.group(1))
+    if m: await process_download(update, m.group(1))
 
 async def main_async():
     keep_alive()
@@ -244,7 +155,5 @@ async def main_async():
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main_async())
-    except (KeyboardInterrupt, SystemExit):
-        pass
+    try: asyncio.run(main_async())
+    except (KeyboardInterrupt, SystemExit): pass
